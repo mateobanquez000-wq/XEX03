@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <atomic>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "dsp/XexEngine.h"
@@ -40,12 +41,18 @@ public:
     std::atomic<int>   telTarget  { -1 };
     std::atomic<bool>  telVoiced  { false };
 
+    // Historial para el visualizador (anillo sin bloqueos, un valor cada ~10 ms; NaN = sin dato)
+    static constexpr int kVisFrames = 1024;   // potencia de 2
+    std::array<std::atomic<float>, kVisFrames> visDet, visOut, visTgt;
+    std::atomic<uint32_t> visWrite { 0 };
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
     xex::Engine engine;
     double currentSampleRate = 48000.0;
     int currentMode = -1;
+    int visCounter = 0, visHop = 480;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (XexProcessor)
 };

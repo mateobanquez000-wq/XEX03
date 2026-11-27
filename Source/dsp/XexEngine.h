@@ -25,6 +25,20 @@ struct Params
     float vibrato  = 0.0f;    // -100..+100 %  0 = conserva el vibrato original
     float mix      = 100.0f;  // 0..100  % de senal procesada
 
+    // Fase 2
+    float transpose = 0.0f;       // -12..+12 semitonos
+    bool  conform   = false;      // la transposicion cae en notas de la escala
+    float detune    = 0.0f;       // -100..+100 cents (referencia de afinacion)
+    float formant   = 0.0f;       // -12..+12 semitonos
+    bool  formantPreserve = true; // true: las formantes no siguen al cambio de altura
+    int   vibShape  = 0;          // 0 apagado, 1 seno, 2 sierra, 3 cuadrada
+    float vibRate   = 5.5f;       // Hz
+    float vibDelay  = 300.0f;     // ms antes de empezar
+    float vibOnset  = 400.0f;     // ms de entrada progresiva
+    float vibVariation = 20.0f;   // % de variacion aleatoria
+    float vibDepth  = 30.0f;      // cents (pico)
+    float vibTrem   = 0.0f;       // % de modulacion de amplitud
+
     std::array<bool, 12> notes;   // notas permitidas por clase de altura (C = 0)
     Params() { notes.fill (true); }
 };
@@ -115,6 +129,8 @@ public:
         vRun = uvRun = 0; voicedState = false; tracking = false;
         corrCenter = 0; mCenter = 0; stableTime = 0; lastNote = -1;
         histN = 0;
+        vibPhase = 0; noiseA = noiseB = 0; rngState = 12345u;
+        gainNow = gainTarget = 1.0f;
         tel = Telemetry();
     }
 
@@ -175,7 +191,7 @@ public:
                     if (dev < 0.001 && std::fabs (delta) < 0.5 * ts)
                         s += 0.08 * (1.0 - dev / 0.001) * delta;
                 }
-                placeGrain (k, s);
+                placeGrain (k, s, ts);
             }
             lastS = s;
             nextSynth = s + ts;
@@ -190,7 +206,10 @@ public:
         norm[idx] = 0.0f;
 
         wv += (wvTarget - wv) * wvSlew;
-        const float proc = wv * wet + (1.0f - wv) * dry;
+        gainNow += (gainTarget - gainNow) * ratioSlew;
+        // al subir la altura hay menos armonicos y el nivel cae; se compensa de forma suave
+        const float lift = ratioNow > 1.0f ? std::sqrt (ratioNow) : 1.0f;
+        const float proc = wv * (wet * gainNow * lift) + (1.0f - wv) * dry;
         const float m = std::clamp (params.mix * 0.01f, 0.0f, 1.0f);
 
         ++n;
@@ -290,6 +309,7 @@ private:
         {
             corrCenter = 0.0f;
             ratioTarget = 1.0f;
+            gainTarget = 1.0f;
             wvTarget = 0.0f;
             tel.voiced = false;
             tel.targetNote = -1;
@@ -308,7 +328,9 @@ private:
 
         t0Cur = std::clamp (sr / fMed, (double) tMin, (double) tMax);
 
-        const float m = 69.0f + 12.0f * std::log2 ((float) fMed / 440.0f);
+        // Detune desplaza la referencia de afinacion (A4 = 440 Hz por defecto)
+        const double fRef = 440.0 * std::pow (2.0, (double) params.detune / 1200.0);
+        const float m = 69.0f + 12.0f * std::log2 ((float) (fMed / fRef));
 
         if (! tracking)
         {
@@ -346,15 +368,67 @@ private:
         corrCenter += alpha * (target - corrCenter);
 
         // vibrato: 0 conserva el original, -100 % lo elimina, +100 % lo duplica
-        const float v    = std::clamp (params.vibrato * 0.01f, -1.0f, 1.0f);
-        const float corr = note >= 0 ? corrCenter + v * d : 0.0f;
+        const float v = std::clamp (params.vibrato * 0.01f, -1.0f, 1.0f);
+        float corr = note >= 0 ? corrCenter + v * d : 0.0f;
 
-        ratioTarget = std::clamp (std::pow (2.0f, corr / 12.0f), 0.5f, 2.0f);
+        // transposicion (opcionalmente ajustada a la escala)
+        const int tr = (int) std::lround (params.transpose);
+        float trShift = (float) tr;
+        if (note >= 0 && params.conform && tr != 0)
+            trShift = (float) (nearestAllowedAbs (note + tr) - note);
+        corr += trShift;
+
+        // vibrato creativo y tremolo
+        float vibCents = 0.0f, trem = 0.0f;
+        if (params.vibShape > 0)
+        {
+            if (stableTime <= 0.0f) vibPhase = 0.0f;
+            const float var = std::clamp (params.vibVariation * 0.01f, 0.0f, 1.0f);
+            noiseA += (nextNoise() - noiseA) * (1.0f - std::exp ((float) -dt / 0.35f));
+            noiseB += (nextNoise() - noiseB) * (1.0f - std::exp ((float) -dt / 0.50f));
+
+            vibPhase += params.vibRate * (1.0f + 0.4f * var * noiseA) * (float) dt;
+            vibPhase -= std::floor (vibPhase);
+
+            float lfo = 0.0f;
+            switch (params.vibShape)
+            {
+                case 1:  lfo = std::sin (2.0f * (float) kPi * vibPhase); break;
+                case 2:  lfo = 2.0f * vibPhase - 1.0f; break;
+                default: lfo = vibPhase < 0.5f ? 1.0f : -1.0f; break;
+            }
+            const float delaySec = params.vibDelay * 0.001f;
+            const float onsetSec = std::max (params.vibOnset * 0.001f, 0.001f);
+            const float env = std::clamp ((stableTime - delaySec) / onsetSec, 0.0f, 1.0f);
+
+            vibCents = lfo * params.vibDepth * (1.0f + 0.3f * var * noiseB) * env;
+            trem = lfo * env * std::clamp (params.vibTrem * 0.01f, 0.0f, 1.0f);
+        }
+        corr += vibCents * 0.01f;
+        gainTarget = 1.0f + 0.35f * trem;
+
+        ratioTarget = std::clamp (std::pow (2.0f, corr / 12.0f), 0.4f, 2.5f);
 
         tel.voiced = true;
         tel.detMidi = m;
         tel.outMidi = m + corr;
-        tel.targetNote = note;
+        tel.targetNote = note >= 0 ? note + (int) std::lround (trShift) : -1;
+    }
+
+    int nearestAllowedAbs (int midi) const
+    {
+        for (int dist = 0; dist <= 6; ++dist)
+        {
+            if (params.notes[(size_t) (((midi + dist) % 12 + 12) % 12)]) return midi + dist;
+            if (params.notes[(size_t) (((midi - dist) % 12 + 12) % 12)]) return midi - dist;
+        }
+        return midi;
+    }
+
+    float nextNoise()
+    {
+        rngState = rngState * 1664525u + 1013904223u;
+        return (float) (rngState >> 8) / (float) (1u << 24) * 2.0f - 1.0f;
     }
 
     // ---------------- PSOLA ----------------
@@ -407,21 +481,32 @@ private:
         lastMark = p;
     }
 
-    void placeGrain (int k, double s)
+    void placeGrain (int k, double s, double ts)
     {
         const int64_t mp = markPos[(size_t) k];
-        const int H = std::clamp ((int) std::lround ((double) markT0[(size_t) k]), 8, tMax);
+        const int Hm = (int) std::lround ((double) markT0[(size_t) k]);
+        // al bajar la altura la separacion de salida crece: se ensancha el grano para que solape
+        const int H = std::clamp (std::max (Hm, (int) std::min (ts, 2.0 * Hm)), 8, tMax);
         const int64_t sInt = (int64_t) std::llround (s);
         const float invH = (float) kPi / (float) H;
+
+        // formantes: leer el grano mas rapido (phi > 1) o mas lento (phi < 1) desplaza el espectro
+        double phi = std::pow (2.0, (double) params.formant / 12.0);
+        if (! params.formantPreserve) phi *= (double) ratioNow;
+        phi = std::clamp (phi, 0.5, 2.2);
 
         for (int j = -H; j <= H; ++j)
         {
             const int64_t o = sInt + j;
-            const int64_t i = mp + j;
-            if (o < n || i > n || i < 0) continue;
-            const float w = 0.5f * (1.0f + std::cos (invH * (float) j));
+            if (o < n) continue;
+            const double pos = (double) mp + (double) j * phi;
+            const int64_t i0 = (int64_t) std::floor (pos);
+            if (i0 < 0 || i0 + 1 > n) continue;
+            const float fr = (float) (pos - (double) i0);
+            const float x  = (1.0f - fr) * in (i0) + fr * in (i0 + 1);
+            const float w  = 0.5f * (1.0f + std::cos (invH * (float) j));
             const size_t oi = (size_t) (o & nMask);
-            acc[oi]  += w * inBuf[(size_t) (i & nMask)];
+            acc[oi]  += w * x;
             norm[oi] += w;
         }
     }
@@ -455,6 +540,10 @@ private:
     int   lastNote = -1;
     float hist[3] = { 0, 0, 0 };
     int   histN = 0;
+
+    float vibPhase = 0.0f, noiseA = 0.0f, noiseB = 0.0f;
+    uint32_t rngState = 12345u;
+    float gainNow = 1.0f, gainTarget = 1.0f;
 
     Telemetry tel;
 };

@@ -15,6 +15,7 @@ public:
 private:
     void timerCallback() override;
     void applyScale();
+    void paintGraph (juce::Graphics&, juce::Rectangle<int> area);
 
     struct Knob
     {
@@ -27,20 +28,28 @@ private:
 
     XexProcessor& proc;
 
-    Knob retune, flex, humanize, vibrato, mix;
+    // fila 1: afinacion + transposicion
+    Knob retune, flex, humanize, natVibrato, mix, transpose, detune, formant;
+    // fila 2: vibrato creativo
+    Knob vibRate, vibDelay, vibOnset, vibVar, vibDepth, vibTrem;
 
-    juce::ComboBox keyBox, scaleBox, modeBox;
-    juce::Label modeLabel;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAttachment;
+    juce::ComboBox keyBox, scaleBox, modeBox, vibShapeBox;
+    juce::Label modeLabel, vibLabel;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAttachment, vibShapeAttachment;
+
+    juce::TextButton conformButton, preserveButton;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> conformAttachment, preserveAttachment;
 
     std::array<juce::TextButton, 12> noteButtons;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>, 12> noteAttachments;
 
-    juce::Rectangle<int> knobPanel, readoutArea, keysArea;
+    juce::Rectangle<int> graphArea, panel1, panel2, readoutArea, keysArea;
 
     float shownDet = 0.0f, shownOut = 0.0f;
     int   shownTarget = -1;
     bool  shownVoiced = false;
+
+    float viewCenter = 57.0f, viewSpan = 14.0f;   // zoom suavizado del visualizador
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (XexEditor)
 };

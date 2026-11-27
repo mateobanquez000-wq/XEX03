@@ -116,6 +116,32 @@ static xex::Params chromatic()
     xex::Params p; p.retuneMs = 0; p.flex = 0; p.humanize = 0; p.vibrato = 0; p.mix = 100; return p;
 }
 
+// centroide espectral (Hz) entre fLo y fHi, ventana Hann
+static double centroidHz (const std::vector<float>& x, double sr, double t0, double t1, double fLo, double fHi)
+{
+    const size_t a = (size_t) (t0 * sr), b = (size_t) (t1 * sr);
+    double sp = 0, sf = 0;
+    for (double f = fLo; f <= fHi; f += 10.0)
+    {
+        double re = 0, im = 0;
+        for (size_t i = a; i < b; ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos (2 * kPi * (double) (i - a) / (double) (b - a));
+            const double ph = 2 * kPi * f * (double) i / sr;
+            re += w * x[i] * std::cos (ph); im += w * x[i] * std::sin (ph);
+        }
+        const double pw = re * re + im * im;
+        sp += pw; sf += pw * f;
+    }
+    return sf / sp;
+}
+
+static double rmsDb (const std::vector<float>& x, size_t a, size_t b)
+{
+    double e = 0; for (size_t i = a; i < b; ++i) e += (double) x[i] * x[i];
+    return 10.0 * std::log10 (e / (double) (b - a) + 1e-20);
+}
+
 int main()
 {
     std::printf ("XEX03 - pruebas del motor\n");
@@ -265,6 +291,122 @@ int main()
         auto out = run (e, in);
         const double secs = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
         CHECK (secs < 2.0, "10 s de audio procesados en %.3f s (%.1f %% de un nucleo)", secs, secs * 10.0);
+    }
+
+    std::printf ("\n===== FASE 2 =====\n");
+
+    {
+        std::printf ("\n[13] Transpose +12: 220 Hz -> 440 Hz\n");
+        xex::Engine e; e.prepare (48000, 0);
+        auto p = chromatic(); p.transpose = 12; e.setParams (p);
+        auto in = genVoice (48000, 220.0, 2.5);
+        auto out = run (e, in);
+        auto c = contour (out, 48000, 1.5, 2.2, 440.0);
+        CHECK (! c.empty() && std::fabs (mean (c)) < 10.0, "error medio %.1f cents", mean (c));
+        CHECK (std::fabs (rmsDb (out, 72000, 100000) - rmsDb (in, 72000, 100000)) < 3.0, "nivel %.1f dB vs entrada", rmsDb (out, 72000, 100000) - rmsDb (in, 72000, 100000));
+    }
+
+    {
+        std::printf ("\n[14] Transpose -12: 330 Hz -> 165 Hz\n");
+        xex::Engine e; e.prepare (48000, 0);
+        auto p = chromatic(); p.transpose = -12; e.setParams (p);
+        auto in = genVoice (48000, 330.0, 2.5);
+        auto out = run (e, in);
+        auto c = contour (out, 48000, 1.5, 2.2, 164.81);
+        CHECK (! c.empty() && std::fabs (mean (c)) < 12.0, "error medio %.1f cents", mean (c));
+        CHECK (std::fabs (rmsDb (out, 72000, 100000) - rmsDb (in, 72000, 100000)) < 3.0, "nivel %.1f dB vs entrada", rmsDb (out, 72000, 100000) - rmsDb (in, 72000, 100000));
+    }
+
+    {
+        std::printf ("\n[15] Conform to Scale: Do mayor, C4 + 1 semitono -> D4 (no C#4)\n");
+        xex::Engine e; e.prepare (48000, 0);
+        auto p = chromatic();
+        const bool maj[12] = { 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1 };
+        for (int i = 0; i < 12; ++i) p.notes[(size_t) i] = maj[i];
+        p.transpose = 1; p.conform = true; e.setParams (p);
+        auto out = run (e, genVoice (48000, 261.63, 2.5));
+        auto c = contour (out, 48000, 1.5, 2.2, 293.66);
+        CHECK (! c.empty() && std::fabs (mean (c)) < 10.0, "error respecto a D4: %.1f cents", mean (c));
+    }
+
+    {
+        std::printf ("\n[16] Detune +30 cents: 220 Hz -> 223.8 Hz\n");
+        xex::Engine e; e.prepare (48000, 0);
+        auto p = chromatic(); p.detune = 30; e.setParams (p);
+        auto out = run (e, genVoice (48000, 220.0, 2.5));
+        auto c = contour (out, 48000, 1.5, 2.2, 220.0 * std::pow (2.0, 30.0 / 1200.0));
+        CHECK (! c.empty() && std::fabs (mean (c)) < 8.0, "error medio %.1f cents", mean (c));
+    }
+
+    {
+        std::printf ("\n[17] Formantes: cambian el timbre sin cambiar la nota\n");
+        auto in = genVoice (48000, 196.0, 2.5);
+        double cen[3]; double pit[3]; int idx = 0;
+        for (float fs : { 0.0f, 7.0f, -5.0f })
+        {
+            xex::Engine e; e.prepare (48000, 0);
+            auto p = chromatic(); p.formant = fs; e.setParams (p);
+            auto out = run (e, in);
+            cen[idx] = centroidHz (out, 48000, 1.6, 2.2, 300, 4500);
+            auto c = contour (out, 48000, 1.5, 2.2, 196.0);
+            pit[idx] = mean (c);
+            ++idx;
+        }
+        CHECK (cen[1] > cen[0] * 1.25, "formant +7: centroide %.0f Hz (neutro %.0f Hz)", cen[1], cen[0]);
+        CHECK (cen[2] < cen[0] * 0.85, "formant -5: centroide %.0f Hz", cen[2]);
+        CHECK (std::fabs (pit[1]) < 10.0 && std::fabs (pit[2]) < 10.0, "la nota no cambia (%.1f / %.1f cents)", pit[1], pit[2]);
+    }
+
+    {
+        std::printf ("\n[18] Formant Preserve apagado: subir una octava mueve tambien las formantes\n");
+        auto in = genVoice (48000, 196.0, 2.5);
+        double cen[2];
+        for (int k = 0; k < 2; ++k)
+        {
+            xex::Engine e; e.prepare (48000, 0);
+            auto p = chromatic(); p.transpose = 12; p.formantPreserve = (k == 0); e.setParams (p);
+            cen[k] = centroidHz (run (e, in), 48000, 1.6, 2.2, 300, 6000);
+        }
+        CHECK (cen[1] > cen[0] * 1.3, "centroide: preservado %.0f Hz, siguiendo la altura %.0f Hz", cen[0], cen[1]);
+    }
+
+    {
+        std::printf ("\n[19] Vibrato creativo (seno, 50 cents, 5.5 Hz) sobre nota fija\n");
+        xex::Engine e; e.prepare (48000, 0);
+        auto p = chromatic(); p.vibShape = 1; p.vibRate = 5.5f; p.vibDepth = 50; p.vibDelay = 0; p.vibOnset = 1; p.vibVariation = 0;
+        e.setParams (p);
+        auto out = run (e, genVoice (48000, 220.0, 3.0));
+        auto c = contour (out, 48000, 1.5, 2.9, 220.0);
+        CHECK (std::fabs (mean (c)) < 10.0, "centro en %.1f cents", mean (c));
+        CHECK (halfRange (c) > 30.0 && halfRange (c) < 60.0, "amplitud %.1f cents (pedido 50)", halfRange (c));
+    }
+
+    {
+        std::printf ("\n[20] Vibrato con Delay 1 s: la nota empieza estable\n");
+        xex::Engine e; e.prepare (48000, 0);
+        auto p = chromatic(); p.vibShape = 1; p.vibDepth = 50; p.vibDelay = 1000; p.vibOnset = 200; p.vibVariation = 0;
+        e.setParams (p);
+        auto out = run (e, genVoice (48000, 220.0, 3.5));
+        auto early = contour (out, 48000, 0.5, 0.9, 220.0);
+        auto late  = contour (out, 48000, 2.2, 3.2, 220.0);
+        CHECK (halfRange (early) < 10.0 && halfRange (late) > 28.0, "amplitud inicial %.1f, final %.1f cents", halfRange (early), halfRange (late));
+    }
+
+    {
+        std::printf ("\n[21] Tremolo (modulacion de amplitud)\n");
+        auto in = genVoice (48000, 220.0, 3.0);
+        double spread[2];
+        for (int k = 0; k < 2; ++k)
+        {
+            xex::Engine e; e.prepare (48000, 0);
+            auto p = chromatic(); p.vibShape = 1; p.vibDepth = 0; p.vibDelay = 0; p.vibOnset = 1; p.vibVariation = 0;
+            p.vibTrem = k == 0 ? 0.0f : 100.0f; e.setParams (p);
+            auto out = run (e, in);
+            double lo = 1e9, hi = -1e9;
+            for (size_t a = 72000; a + 480 < 140000; a += 480) { const double d = rmsDb (out, a, a + 480); lo = std::min (lo, d); hi = std::max (hi, d); }
+            spread[k] = hi - lo;
+        }
+        CHECK (spread[1] > spread[0] + 3.0, "variacion de nivel: sin tremolo %.1f dB, con tremolo %.1f dB", spread[0], spread[1]);
     }
 
     std::printf ("\n%s (%d fallos)\n", failures == 0 ? "TODO OK" : "HAY FALLOS", failures);
